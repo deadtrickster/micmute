@@ -81,29 +81,37 @@ There is a headless mode for debugging a setup without touching the menu bar:
 ./MicMute.app/Contents/MacOS/MicMute --render out.png --live
 ```
 
-## Nothing is polled
+## Reads once, then owns the microphone
 
-Both inputs are subscriptions, so the app sits still instead of asking:
+There is no polling. At startup the app reads the datastore once, puts its routing in
+place, and from then on it is the only thing managing input 1: what the icon and the slider
+show is its own state, and every change it makes goes straight to the device.
 
-- **Device state** comes from the datastore's own long-poll. `GET /datastore` with
-  `If-None-Match: <etag>` is *held open by the interface for ~10 s* and then answers `304`
-  with an empty body; the moment anything changes it answers `200` carrying **only the keys
-  that changed** — turning the mute yields a 28-byte delta. So while idle the app never
-  re-reads or re-parses the 200 KB tree; it holds one socket and parses a few bytes when
-  something actually moves. A full read happens only at startup, after an error, or when
-  the device no longer recognises our version (a reboot).
-- **"Is an app capturing"** comes from CoreAudio property listeners — the HAL's process
-  list plus each process's `kAudioProcessPropertyIsRunningInput`. The callbacks fire only
-  when an app really starts or stops capturing.
+Two things can invalidate that picture, and both are events rather than timers:
 
-The only timer in the program is the level meter, and it exists only while the panel is
-open. Nothing runs on a schedule.
+- **The interface went away or came back.** A listener on CoreAudio's device list catches it.
+  When the 828ES reappears the app reads the datastore again and re-applies the routing,
+  because a power cycle or a preset recall reverts the device to its own Interface routing —
+  and a mute indicator that lies is worse than no indicator at all.
+- **You open the panel.** One read, because that may be the first look in hours, and the gain
+  knob on the front panel is physical.
 
-Measured on this setup: the reactive build spends **0.09 s of CPU per 180 s — 0.05 % of a
-core** — with the panel closed, and a flat memory footprint. The previous build, which
-polled every 4 s and re-parsed the tree each time, spent **0.12 s per 10 s (1.2 %)** doing
-nothing at all. What remains is the ten-second heartbeat the protocol itself imposes: one
-`304` round trip, no body, no parse.
+Plus *Read settings from interface* in the menu, and a read after any failed write.
+
+**"Is an app capturing"** comes from CoreAudio property listeners — the HAL's process list
+plus each process's `kAudioProcessPropertyIsRunningInput` — so those callbacks fire only when
+an app really starts or stops capturing.
+
+The only timer in the program is the level meter, and it exists only while the panel is open.
+
+Measured on this setup: 0.10 s of CPU for the whole startup read, and **0.00 s over the next
+two minutes** — after that the process does not run, has no open connection and sends no
+traffic. (An earlier version watched the device through its long-poll, which the device does
+support: `If-None-Match` answers `304` after ~10 s, or `200` with only the changed keys. That
+cost 0.05 % of a core, forever, to watch a microphone this app already owns.)
+
+The trade: if something *else* changes input 1 on the device — the MOTU web UI, another
+controller — this app will not notice until its next read. It is built to own the mic.
 
 ## Limits
 
@@ -114,6 +122,9 @@ nothing at all. What remains is the ten-second heartbeat the protocol itself imp
 - "In use" means *any* app is capturing an input: macOS does not say which device a
   process holds (its per-process `kAudioProcessPropertyDevices` is empty), so the app
   names the app but cannot verify it took this interface.
+- Nothing watches the device, so a change made by something else (the MOTU web UI, a second
+  controller) is picked up at the next read, not immediately. That is the price of running
+  at zero; *Read settings from interface* forces one.
 - Everything device-specific lives in `Sources/Config.swift`: input bank/channel, mixer
   channel, group bus and the computer channel. On another MOTU AVB/Pro Audio model the
   bank numbers differ — read them from `ext/ibank/N/name` in `/datastore`.

@@ -11,33 +11,24 @@ enum MotuError: LocalizedError {
     }
 }
 
-enum DatastoreEvent {
-    /// The device held the request for its full window and nothing changed.
-    case unchanged
-    /// Changed keys only (small delta), or the whole tree if the device no longer
-    /// knows our version.
-    case changed([String: Any])
-}
-
 /// Client for the MOTU datastore API.
 ///
-///   read  : GET  /datastore, optionally `If-None-Match: <etag>` — this is a long-poll:
-///           the device holds the request ~10 s and then answers either
-///           `304` with an empty body (nothing changed) or `200` with a JSON object
-///           holding *only the keys that changed*. That is how the app subscribes
-///           instead of polling.
+///   read  : GET /datastore — once at startup, and again only when something suggests the
+///           device changed: it reappeared in CoreAudio, the panel was opened, or a write
+///           failed. The device also offers a long-poll (`If-None-Match` answers `304`
+///           after ~10 s, or `200` with just the changed keys), and an earlier version of
+///           this app used it; it is deliberately not used here. The app reads once and
+///           then owns the microphone, so idle means no traffic and no wakeups at all.
 ///   write : POST /datastore?client=<id>, multipart/form-data, field `json` = {path: value}
 final class MotuClient {
     let host: String
-    private var etag: String?
 
-    /// Ephemeral, no URL cache: nothing is written to disk, and the connection is
-    /// kept alive so the long-poll cycle costs one socket rather than one handshake.
+    /// Ephemeral, no URL cache: nothing is written to disk.
     private static let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.urlCache = nil
-        config.timeoutIntervalForRequest = 40      // the device holds ~10 s
+        config.timeoutIntervalForRequest = 10
         config.httpMaximumConnectionsPerHost = 2
         return URLSession(configuration: config)
     }()
@@ -46,7 +37,7 @@ final class MotuClient {
 
     private func url(_ path: String) -> URL? { URL(string: "http://\(host)/\(path)") }
 
-    /// Full read: first sync, resync after an error. Learns the ETag.
+    /// The whole datastore: startup, resync after an error, or after the device came back.
     func fetchAll() async throws -> [String: Any] {
         guard let u = url("datastore") else { throw MotuError.badResponse }
         var req = URLRequest(url: u)
@@ -54,33 +45,10 @@ final class MotuClient {
         let (data, resp) = try await Self.session.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw MotuError.badResponse }
         guard http.statusCode == 200 else { throw MotuError.http(http.statusCode) }
-        etag = http.value(forHTTPHeaderField: "ETag")
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw MotuError.badResponse
         }
         return obj
-    }
-
-    /// One long-poll. Returns after the device answers — up to ~10 s of doing nothing.
-    func poll() async throws -> DatastoreEvent {
-        guard let u = url("datastore") else { throw MotuError.badResponse }
-        var req = URLRequest(url: u)
-        req.timeoutInterval = 40
-        if let etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-        let (data, resp) = try await Self.session.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw MotuError.badResponse }
-        if let newTag = http.value(forHTTPHeaderField: "ETag") { etag = newTag }
-        switch http.statusCode {
-        case 304:
-            return .unchanged
-        case 200:
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw MotuError.badResponse
-            }
-            return .changed(obj)
-        default:
-            throw MotuError.http(http.statusCode)
-        }
     }
 
     func write(_ values: [String: Any]) async throws {

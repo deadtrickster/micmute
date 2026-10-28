@@ -265,3 +265,38 @@ final class UsageMonitor {
         }
     }
 }
+
+/// Event-driven notice that the set of audio devices changed — the interface was
+/// unplugged, powered off, or came back. Costs nothing while nothing happens, which
+/// is why the app can afford to have no polling at all.
+final class DeviceMonitor {
+    var onChange: (() -> Void)?
+
+    private let queue = DispatchQueue(label: "micmute.devices", qos: .utility)
+    private var block: AudioObjectPropertyListenerBlock?
+    private var running = false
+
+    func start() {
+        guard !running else { return }
+        running = true
+        var a = CA.addr(kAudioHardwarePropertyDevices)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, self.running, let onChange = self.onChange else { return }
+            DispatchQueue.main.async { onChange() }
+        }
+        if AudioObjectAddPropertyListenerBlock(CA.system, &a, queue, listener) == noErr {
+            block = listener
+        }
+    }
+
+    func stop() {
+        running = false
+        if let block {
+            var a = CA.addr(kAudioHardwarePropertyDevices)
+            AudioObjectRemovePropertyListenerBlock(CA.system, &a, queue, block)
+        }
+        block = nil
+    }
+
+    deinit { stop() }
+}

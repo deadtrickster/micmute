@@ -31,18 +31,20 @@ final class MicModel: ObservableObject {
 
     let meter = Meter()
     private let usage = UsageMonitor()
+    private let devices = DeviceMonitor()
     private var client: MotuClient?
     private var deviceID: AudioObjectID?
-    private var watchTask: Task<Void, Never>?
 
-    /// The last known value of every datastore key we care about, built up from deltas.
+    /// The last values we read from (or wrote to) the device. The app is the only thing
+    /// that manages this microphone, so this cache is the truth once the first read is in.
     private var values: [String: Any] = [:]
 
-    // Echoes of our own writes arrive as deltas a moment later; ignoring them for a
-    // beat keeps the slider and the button from flickering back under the user.
+    /// Kept so a stale in-flight read cannot undo an optimistic click.
     private var localMuteWriteAt: Date?
     private var localGainWriteAt: Date?
     private var nextRoutingAttempt = Date.distantPast
+    private var lastSyncAt = Date.distantPast
+    private var interfaceWasPresent = true
 
     var state: MicState {
         if !connected { return .offline }
@@ -80,8 +82,16 @@ final class MicModel: ObservableObject {
     func start() async {
         usage.onChange = { [weak self] names in self?.capturing = names }
         usage.start()
+
+        // Nothing polls. The one thing that can invalidate our picture is the interface
+        // itself changing — unplugged, powered off, or back with its own routing again —
+        // and CoreAudio tells us that for free.
+        devices.onChange = { [weak self] in
+            Task { @MainActor in await self?.interfaceListChanged() }
+        }
+        devices.start()
+
         await resync()
-        startWatching()
     }
 
     private func log(_ m: String) { FileHandle.standardError.write(Data("[micmute] \(m)\n".utf8)) }
@@ -108,55 +118,43 @@ final class MicModel: ObservableObject {
         return found.0
     }
 
-    // MARK: - the subscription
+    // MARK: - reading the device
 
-    /// One long-poll at a time, forever. The device answers `unchanged` after its ~10 s
-    /// window, or `changed` with just the keys that moved — no polling, no full reads.
-    private func startWatching() {
-        guard watchTask == nil else { return }
-        watchTask = Task { [weak self] in
-            var backoff: UInt64 = 0
-            while !Task.isCancelled {
-                guard let self else { return }
-                guard let client = await self.ensureClient() else {
-                    backoff = self.nextBackoff(backoff)
-                    try? await Task.sleep(nanoseconds: backoff * 1_000_000_000)
-                    await self.resync()
-                    continue
-                }
-                do {
-                    switch try await client.poll() {
-                    case .unchanged:
-                        backoff = 0
-                    case .changed(let delta):
-                        backoff = 0
-                        await self.absorb(delta)
-                    }
-                } catch {
-                    await self.markOffline(error)
-                    backoff = self.nextBackoff(backoff)
-                    try? await Task.sleep(nanoseconds: backoff * 1_000_000_000)
-                    await self.resync()
-                }
-            }
-        }
-    }
-
-    private func nextBackoff(_ current: UInt64) -> UInt64 {
-        current == 0 ? 1 : min(current * 2, 10)
-    }
-
-    /// Full read: used at startup, after an error, and after we changed the routing.
+    /// Read the whole datastore. Called at startup, when the interface reappears, when the
+    /// panel is opened (it may be hours later, and the front-panel gain knob is physical),
+    /// and after a write fails.
     func resync() async {
         guard let client = await ensureClient() else { return }
         do {
             let all = try await client.fetchAll()
             connected = true
             lastError = nil
+            lastSyncAt = Date()
             absorbFull(all)
         } catch {
             await markOffline(error)
         }
+    }
+
+    /// Cheap guard so opening the panel twice in a row does not read twice.
+    func resyncIfStale(olderThan seconds: TimeInterval = 5) async {
+        guard Date().timeIntervalSince(lastSyncAt) > seconds else { return }
+        await resync()
+    }
+
+    /// The set of audio devices changed. Only a change in the interface's own presence is
+    /// worth a read: plugging in headphones should not cost a datastore trip.
+    private func interfaceListChanged() async {
+        deviceID = nil
+        let present = CA.findInterface() != nil
+        let wasPresent = interfaceWasPresent
+        interfaceWasPresent = present
+        guard present else {
+            connected = false              // unplugged or off: say so rather than guess
+            return
+        }
+        // Back from the dead: a power cycle reverts the device to its own routing.
+        if !wasPresent || !connected { await resync() }
     }
 
     /// Keep only the keys we use, so the 200 KB tree is not held on to.
@@ -167,21 +165,7 @@ final class MicModel: ObservableObject {
         Task { await ensureRoutingIfNeeded() }
     }
 
-    private func absorb(_ delta: [String: Any]) async {
-        // A delta carries only the keys that changed — but if the device no longer knew
-        // our ETag (a reboot, say) it answers with the whole 200 KB tree instead, so
-        // keep only the keys we track and never let the dictionary grow into that.
-        for (key, value) in delta where Cfg.watchedKeys.contains(key) { values[key] = value }
-        if let model = Cfg.avbValue(delta, "model_name") { deviceName = model }
-        connected = true
-        lastError = nil
-        if ProcessInfo.processInfo.environment["MICMUTE_DEBUG"] != nil {
-            log("delta \(delta.keys.sorted().prefix(6))\(delta.count > 6 ? " +" : "")")
-        }
-        apply(values)
-        await ensureRoutingIfNeeded()
-    }
-
+    /// Not called while idle — there is nothing listening for changes on the device side.
     private func apply(_ v: [String: Any]) {
         if let m = Val.bool(v[Cfg.mutePath]), !isRecent(localMuteWriteAt) { muted = m }
         if let g = Val.num(v[Cfg.trimPath]), !isRecent(localGainWriteAt) { gainDb = g }
@@ -264,11 +248,14 @@ final class MicModel: ObservableObject {
         guard let client = await ensureClient() else { connected = false; return }
         do {
             try await client.write([Cfg.mutePath: target ? 1 : 0])
+            values[Cfg.mutePath] = target ? 1.0 : 0.0
             connected = true
             lastError = nil
         } catch {
             muted = !target                  // roll back
             lastError = "Mute failed: \(error.localizedDescription)"
+            self.client = nil                // force rediscovery on the next try
+            await resync()
         }
     }
 
@@ -288,7 +275,14 @@ final class MicModel: ObservableObject {
                 guard let self, let v = self.pendingGain else { break }
                 self.pendingGain = nil
                 if let client = await self.ensureClient() {
-                    try? await client.write([Cfg.trimPath: Int(v.rounded())])
+                    do {
+                        try await client.write([Cfg.trimPath: Int(v.rounded())])
+                        self.values[Cfg.trimPath] = Int(v.rounded())
+                    } catch {
+                        self.lastError = "Gain failed: \(error.localizedDescription)"
+                        self.client = nil
+                        await self.resync()
+                    }
                 }
             }
             self?.gainWriteTask = nil

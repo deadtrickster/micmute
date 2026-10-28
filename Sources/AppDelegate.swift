@@ -114,7 +114,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.contentViewController = NSHostingController(rootView: makePanel())
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        Task { await model.startMetering() }
+        Task {
+            await model.startMetering()
+            // The panel may be the first look in hours, and the gain knob on the front
+            // panel is physical: one read here, not a timer.
+            await model.resyncIfStale()
+        }
         updateStatusItem()
     }
 
@@ -135,6 +140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let login = NSMenuItem(title: "Start at login", action: #selector(toggleLogin), keyEquivalent: "")
         login.state = Prefs.startAtLogin ? .on : .off
         menu.addItem(login)
+        menu.addItem(withTitle: "Read settings from interface", action: #selector(resyncNow), keyEquivalent: "")
         menu.addItem(withTitle: "Restore interface routing and quit…", action: #selector(restoreRouting), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit MicMute", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -144,6 +150,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func hotkeyMute() { Task { await model.toggleMute(); updateStatusItem() } }
+
+    @objc private func resyncNow() { Task { await model.resync(); updateStatusItem(force: true) } }
 
     /// Putting the interface's own routing back is the uninstall step: the mute lives in
     /// the mixer, so it stops working the moment the app is not there to keep the routing.
