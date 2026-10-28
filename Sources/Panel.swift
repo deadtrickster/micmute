@@ -80,8 +80,9 @@ struct PanelView: View {
                         .help(model.lastError ?? "")
                 }
                 Spacer()
-                Button("Restore routing") { onRestore() }
+                Button("Restore & quit") { onRestore() }
                     .buttonStyle(.link).font(.system(size: 10))
+                    .help("Put Computer 1 back on the direct input path and quit")
                 Button("Quit") { onQuit() }
                     .buttonStyle(.link).font(.system(size: 10))
             }
