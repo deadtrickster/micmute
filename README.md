@@ -104,11 +104,12 @@ an app really starts or stops capturing.
 
 The only timer in the program is the level meter, and it exists only while the panel is open.
 
-Measured on this setup: 0.10 s of CPU for the whole startup read, and **0.00 s over the next
-two minutes** — after that the process does not run, has no open connection and sends no
-traffic. (An earlier version watched the device through its long-poll, which the device does
-support: `If-None-Match` answers `304` after ~10 s, or `200` with only the changed keys. That
-cost 0.05 % of a core, forever, to watch a microphone this app already owns.)
+Measured on this setup: 0.10 s of CPU for the whole startup read, and then **0.00 s over the
+next three minutes** — the CPU-time counter did not move at all, RSS did not move, and there
+was no socket to the device. (An earlier version watched the device through its long-poll,
+which the device does support: `If-None-Match` answers `304` after ~10 s, or `200` with only
+the changed keys. That cost 0.05 % of a core, forever, to watch a microphone this app already
+owns.)
 
 The trade: if something *else* changes input 1 on the device — the MOTU web UI, another
 controller — this app will not notice until its next read. It is built to own the mic.
