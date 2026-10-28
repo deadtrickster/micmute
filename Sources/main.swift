@@ -1,5 +1,16 @@
 import AppKit
 
+// Uninstall step, scriptable: put Computer 1 back on the direct input path and unmute.
+if CommandLine.arguments.contains("--restore") {
+    Task { @MainActor in
+        let model = MicModel()
+        await model.restoreInterfaceRouting()
+        print("interface routing restored; input 1 is unmuted")
+        exit(0)
+    }
+    RunLoop.main.run()
+}
+
 if let i = CommandLine.arguments.firstIndex(of: "--render") {
     let path = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "/tmp/panel.png"
     MainActor.assumeIsolated { Render.run(to: path) }

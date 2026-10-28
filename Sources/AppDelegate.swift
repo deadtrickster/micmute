@@ -9,11 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let model = MicModel()
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
-    private var pollTimer: Timer?
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
-
-    private var panelVisible: Bool { popover.isShown }
 
     func log(_ m: String) { FileHandle.standardError.write(Data("[micmute] \(m)\n".utf8)) }
 
@@ -38,7 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         updateStatusItem()
         registerHotKey()
-        schedulePoll(visible: false)
 
         if CommandLine.arguments.contains("--panel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -47,12 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
 
-        Task {
-            log("first refresh")
-            await model.refresh()
-            log("first refresh done: connected=\(model.connected) muted=\(model.muted) capturing=\(model.capturing)")
-            updateStatusItem()
-        }
+        Task { await model.start() }
     }
 
     private var cancellables = Set<AnyCancellable>()
@@ -60,15 +51,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func makePanel() -> PanelView {
         PanelView(model: model,
                   onToggleMute: { Task { await self.model.toggleMute(); self.updateStatusItem() } },
-                  onRestore: { Task { await self.model.restoreInterfaceRouting(); self.updateStatusItem() } },
+                  onRestore: { self.restoreRoutingFlow() },
                   onQuit: { NSApp.terminate(nil) })
     }
 
     // MARK: - status item
 
-    private func updateStatusItem() {
+    /// Skip re-rendering the menu bar icon when nothing it shows has changed: deltas
+    /// arrive for any datastore key, not just the ones the icon depends on.
+    private var lastShown: (state: MicState, muted: Bool, capturing: [String])?
+
+    private func updateStatusItem(force: Bool = false) {
         guard let button = statusItem.button else { return }
         let state = model.state
+        if !force, let last = lastShown, last.state == state,
+           last.muted == model.muted, last.capturing == model.capturing {
+            return
+        }
+        lastShown = (state, model.muted, model.capturing)
         let (color, muted): (NSColor, Bool) = {
             switch state {
             case .live: return (.systemRed, false)
@@ -114,13 +114,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.contentViewController = NSHostingController(rootView: makePanel())
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        Task { await model.startMetering(); await model.refresh(); updateStatusItem() }
-        schedulePoll(visible: true)
+        Task { await model.startMetering() }
+        updateStatusItem()
     }
 
     func popoverDidClose(_ notification: Notification) {
         model.stopMetering()          // no audio device IO while hidden
-        schedulePoll(visible: false)
     }
 
     private func showMenu() {
@@ -136,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let login = NSMenuItem(title: "Start at login", action: #selector(toggleLogin), keyEquivalent: "")
         login.state = Prefs.startAtLogin ? .on : .off
         menu.addItem(login)
-        menu.addItem(withTitle: "Restore interface routing…", action: #selector(restoreRouting), keyEquivalent: "")
+        menu.addItem(withTitle: "Restore interface routing and quit…", action: #selector(restoreRouting), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit MicMute", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         statusItem.menu = menu
@@ -145,7 +144,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func hotkeyMute() { Task { await model.toggleMute(); updateStatusItem() } }
-    @objc private func restoreRouting() { Task { await model.restoreInterfaceRouting(); updateStatusItem() } }
+
+    /// Putting the interface's own routing back is the uninstall step: the mute lives in
+    /// the mixer, so it stops working the moment the app is not there to keep the routing.
+    /// Ask first, then do it and go away rather than sit there enforcing it back.
+    private func restoreRoutingFlow() {
+        let alert = NSAlert()
+        alert.messageText = "Restore the interface's own routing?"
+        alert.informativeText = "Computer 1 will go back to the direct Mic Inst 1 path, the mic will be unmuted, and MicMute will quit. The hardware mute needs the mixer, so it stops working until MicMute runs again."
+        alert.addButton(withTitle: "Restore and Quit")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            await model.restoreInterfaceRouting()
+            NSApp.terminate(nil)
+        }
+    }
+
+    @objc private func restoreRouting() { restoreRoutingFlow() }
     @objc private func toggleLogin() {
         Prefs.startAtLogin.toggle()
         do {
@@ -153,21 +170,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             else { try SMAppService.mainApp.unregister() }
         } catch {
             model.lastError = "Login item: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - polling
-
-    /// Cheap when hidden: one datastore read every 4 s and no audio device IO at all.
-    private func schedulePoll(visible: Bool) {
-        pollTimer?.invalidate()
-        let interval: TimeInterval = visible ? 1.5 : 4.0
-        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.model.refresh()
-                self.updateStatusItem()
-            }
         }
     }
 

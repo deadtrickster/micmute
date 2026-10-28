@@ -33,6 +33,13 @@ enum Cfg {
     static var groupFaderPath: String { "mix/group/\(groupBus)/matrix/fader" }
     static var groupMutePath: String { "mix/group/\(groupBus)/matrix/mute" }
     static var computerSrcPath: String { "ext/obank/7/ch/\(computerChannel)/src" }
+
+    /// The datastore keys this app tracks. Deltas carry only these, and keeping the
+    /// shortlist means the full 200 KB tree never has to be retained.
+    static var watchedKeys: [String] {
+        [mutePath, trimPath, trimRangePath, inputNamePath,
+         computerSrcPath, sendPath, groupFaderPath, groupMutePath]
+    }
     /// The device publishes its model name and firmware under `avb/<its own EUI-64>/`,
     /// so look the entry up rather than hardcoding one machine's identifier.
     static func avbValue(_ all: [String: Any], _ suffix: String) -> String? {

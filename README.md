@@ -66,6 +66,13 @@ open MicMute.app
 
 No dependencies, no Xcode project: one `swiftc` invocation over `Sources/*.swift`.
 
+To put the interface back the way it shipped (uninstall step — the mute lives in the
+mixer, so it stops working once nothing keeps that routing in place):
+
+```sh
+./MicMute.app/Contents/MacOS/MicMute --restore
+```
+
 There is a headless mode for debugging a setup without touching the menu bar:
 
 ```sh
@@ -74,18 +81,30 @@ There is a headless mode for debugging a setup without touching the menu bar:
 ./MicMute.app/Contents/MacOS/MicMute --render out.png --live
 ```
 
-## Cost
+## Nothing is polled
 
-Nothing while the panel is closed: no audio device IO at all (the interface is not even
-marked as running), and one small HTTP read every 4 s so the icon stays honest. While the
-panel is open the meter taps input 1 and state refreshes at 1.5 s. Measured: 0.0 % CPU
-either way.
+Both inputs are subscriptions, so the app sits still instead of asking:
+
+- **Device state** comes from the datastore's own long-poll. `GET /datastore` with
+  `If-None-Match: <etag>` is *held open by the interface for ~10 s* and then answers `304`
+  with an empty body; the moment anything changes it answers `200` carrying **only the keys
+  that changed** — turning the mute yields a 28-byte delta. So while idle the app never
+  re-reads or re-parses the 200 KB tree; it holds one socket and parses a few bytes when
+  something actually moves. A full read happens only at startup, after an error, or when
+  the device no longer recognises our version (a reboot).
+- **"Is an app capturing"** comes from CoreAudio property listeners — the HAL's process
+  list plus each process's `kAudioProcessPropertyIsRunningInput`. The callbacks fire only
+  when an app really starts or stops capturing.
+
+The only timer in the program is the level meter, and it exists only while the panel is
+open. Nothing runs on a schedule.
 
 ## Limits
 
 - The mute lives in the hardware, so quitting while muted leaves the microphone muted.
-  *Restore routing* (panel or menu) also unmutes and returns Computer 1 to the direct
-  `Mic Inst 1` path — do that before uninstalling.
+  *Restore interface routing and quit* (panel or right-click menu) also unmutes and returns
+  Computer 1 to the direct `Mic Inst 1` path — do that before uninstalling, or run
+  `--restore`.
 - "In use" means *any* app is capturing an input: macOS does not say which device a
   process holds (its per-process `kAudioProcessPropertyDevices` is empty), so the app
   names the app but cannot verify it took this interface.

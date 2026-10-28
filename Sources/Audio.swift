@@ -58,21 +58,35 @@ enum CA {
 
     /// Names of apps currently capturing from an input, excluding ourselves.
     static func inputUsers() -> [String] {
-        var a = addr(kAudioHardwarePropertyProcessObjectList)
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
-        var procs = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &procs) == noErr else { return [] }
-
         let myPid = ProcessInfo.processInfo.processIdentifier
         var names: [String] = []
-        for p in procs {
+        for p in processObjects() {
             guard u32(p, kAudioProcessPropertyIsRunningInput) != 0 else { continue }
             let pid = pid_t(bitPattern: u32(p, kAudioProcessPropertyPID))
             if pid == myPid { continue }   // our own metering tap doesn't count
             names.append(processName(pid, obj: p))
         }
         return Array(Set(names)).sorted()
+    }
+
+    /// Every process object the HAL knows about (one per process doing audio IO).
+    static func processObjects() -> [AudioObjectID] {
+        var a = addr(kAudioHardwarePropertyProcessObjectList)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var procs = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &procs) == noErr else { return [] }
+        return procs
+    }
+
+    /// Is this device id still present? (A cached id goes stale when the box is unplugged.)
+    static func deviceExists(_ id: AudioObjectID) -> Bool {
+        var a = addr(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &a, 0, nil, &size) == noErr else { return false }
+        var devs = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &a, 0, nil, &size, &devs) == noErr else { return false }
+        return devs.contains(id)
     }
 
     /// Human name for a capturing process: the app name if it is a bundle,
@@ -175,4 +189,79 @@ final class Meter {
     }
 
     deinit { stop() }
+}
+
+/// Event-driven answer to "is an app capturing?" — no polling.
+///
+/// Listens to the HAL's process list and to each process's input-running flag, so the
+/// callbacks only fire when something actually starts or stops capturing. Re-attaches
+/// to processes as they appear and disappear.
+final class UsageMonitor {
+    /// Called on the main queue with the app names, only when the set changes.
+    var onChange: (([String]) -> Void)?
+
+    private let queue = DispatchQueue(label: "micmute.usage", qos: .utility)
+    private var systemBlock: AudioObjectPropertyListenerBlock?
+    private var processBlocks: [AudioObjectID: AudioObjectPropertyListenerBlock] = [:]
+    private var running = false
+    private var lastReported: [String]?
+
+    func start() {
+        guard !running else { return }
+        running = true
+        var a = CA.addr(kAudioHardwarePropertyProcessObjectList)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.rescan() }
+        if AudioObjectAddPropertyListenerBlock(CA.system, &a, queue, block) == noErr {
+            systemBlock = block
+        }
+        rescan()
+    }
+
+    func stop() {
+        running = false
+        if let block = systemBlock {
+            var a = CA.addr(kAudioHardwarePropertyProcessObjectList)
+            AudioObjectRemovePropertyListenerBlock(CA.system, &a, queue, block)
+            systemBlock = nil
+        }
+        for (obj, block) in processBlocks {
+            var a = CA.addr(kAudioProcessPropertyIsRunningInput)
+            AudioObjectRemovePropertyListenerBlock(obj, &a, queue, block)
+        }
+        processBlocks.removeAll()
+    }
+
+    deinit { stop() }
+
+    /// Re-attach to processes that appeared or went away, then report if the set changed.
+    private func rescan() {
+        guard running else { return }
+        let objs = CA.processObjects()
+        let live = Set(objs)
+
+        // collect first: removing while iterating the dictionary would be a mutation
+        // during enumeration.
+        let gone = processBlocks.keys.filter { !live.contains($0) }
+        for obj in gone {
+            if let block = processBlocks[obj] {
+                var a = CA.addr(kAudioProcessPropertyIsRunningInput)
+                AudioObjectRemovePropertyListenerBlock(obj, &a, queue, block)
+                processBlocks.removeValue(forKey: obj)
+            }
+        }
+        for obj in objs where processBlocks[obj] == nil {
+            var a = CA.addr(kAudioProcessPropertyIsRunningInput)
+            let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.rescan() }
+            if AudioObjectAddPropertyListenerBlock(obj, &a, queue, block) == noErr {
+                processBlocks[obj] = block
+            }
+        }
+
+        let names = CA.inputUsers()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.running, self.lastReported != names else { return }
+            self.lastReported = names
+            self.onChange?(names)
+        }
+    }
 }
